@@ -19,54 +19,93 @@ import java.util.stream.Collectors;
 @Slf4j
 public class RagService {
 
-    private final ChatClient  chatClient;
+    private final ChatClient chatClient;
     private final VectorStore vectorStore;
 
     public String processQuery(String query, String section, String subsection) {
-
         try {
-            // ---------- similarity search *with metadata filter* ----------
-            SearchRequest searchReq = SearchRequest.query(query).withTopK(5);
+            // Search for relevant documents with metadata filtering
+            SearchRequest searchReq = SearchRequest.query(query).withTopK(8);
 
             List<Document> relevantDocs = vectorStore.similaritySearch(
-                    searchReq,
-                    doc -> {
-                        String docSection    = (String) doc.getMetadata().getOrDefault("section", "");
-                        String docSubsection = (String) doc.getMetadata().getOrDefault("subsection", "");
-                        boolean sectionMatch    = section == null    || section.equalsIgnoreCase(docSection);
-                        boolean subsectionMatch = subsection == null || subsection.equalsIgnoreCase(docSubsection);
-                        return sectionMatch && subsectionMatch;
-                    }
+                searchReq,
+                doc -> {
+                    String docSection = (String) doc.getMetadata().getOrDefault("section", "");
+                    String docSubsection = (String) doc.getMetadata().getOrDefault("subsection", "");
+                    boolean sectionMatch = section == null || section.equalsIgnoreCase(docSection);
+                    boolean subsectionMatch = subsection == null || subsection.equalsIgnoreCase(docSubsection);
+                    return sectionMatch && subsectionMatch;
+                }
             );
 
-            String context = relevantDocs.stream()
-                                         .map(Document::getContent)
-                                         .collect(Collectors.joining("\n\n"));
+            // Separate and prioritize different document types
+            List<Document> generalInfo = relevantDocs.stream()
+                .filter(doc -> "general_info".equals(doc.getMetadata().get("type")))
+                .limit(2)
+                .toList();
 
-            String systemPrompt = """
-                You are a helpful tax-filing assistant for Befiler.com.
-                Use the context below to answer the question. If it is insufficient,
-                say so briefly and suggest the user check the full documentation.
+            List<Document> qaPairs = relevantDocs.stream()
+                .filter(doc -> "qa_pair".equals(doc.getMetadata().get("type")))
+                .limit(4)
+                .toList();
+
+            // Build context with structured formatting
+            StringBuilder contextBuilder = new StringBuilder();
+            
+            if (!generalInfo.isEmpty()) {
+                contextBuilder.append("GENERAL INFORMATION:\n");
+                generalInfo.forEach(doc -> {
+                    contextBuilder.append("- ").append(doc.getContent()).append("\n\n");
+                });
+            }
+            
+            if (!qaPairs.isEmpty()) {
+                contextBuilder.append("RELEVANT Q&A:\n");
+                qaPairs.forEach(doc -> {
+                    contextBuilder.append("- ").append(doc.getContent()).append("\n\n");
+                });
+            }
+
+            String context = contextBuilder.toString();
+
+            String systemPrompt = String.format("""
+                You are a helpful tax-filing assistant for Befiler.com, specializing in Pakistani tax law.
+                
+                Use the context below to answer the user's question. Prioritize accuracy and be specific.
+                If the context doesn't contain sufficient information, acknowledge this and suggest 
+                consulting with a tax professional or checking official FBR documentation.
+                
+                When answering:
+                1. Be direct and practical
+                2. Use simple language
+                3. Provide actionable advice when possible
+                4. Reference relevant sections/subsections when helpful
                 
                 Context:
                 %s
                 
                 Current section: %s
                 Current subsection: %s
-                """.formatted(context, section, subsection);
+                """, context, section != null ? section : "General", subsection != null ? subsection : "N/A");
 
             List<Message> messages = List.of(
-                    new UserMessage(systemPrompt + "\n\nQuestion: " + query)
+                new UserMessage(systemPrompt + "\n\nUser Question: " + query)
             );
 
-            return chatClient.call(new Prompt(messages))
-                             .getResult()
-                             .getOutput()
-                             .getContent();
+            String response = chatClient.call(new Prompt(messages))
+                .getResult()
+                .getOutput()
+                .getContent();
+
+            log.info("RAG query processed: section={}, subsection={}, docs_found={}", 
+                    section, subsection, relevantDocs.size());
+
+            return response;
 
         } catch (Exception e) {
-            log.error("RAG failure", e);
-            return "Sorry, I’m having trouble retrieving the answer just now. Please try again shortly.";
+            log.error("RAG processing failed for query: {}", query, e);
+            return "I'm sorry, I'm having trouble processing your request right now. " +
+                   "Please try rephrasing your question or contact support if the issue persists.";
         }
     }
 }
